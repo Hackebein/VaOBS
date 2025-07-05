@@ -3,6 +3,10 @@ name: Build Executable
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write  # Required for creating releases
 
 jobs:
   build-windows:
@@ -46,24 +50,22 @@ jobs:
         retention-days: 30
         
     - name: Create release on tag
-      id: create_release
       if: startsWith(github.ref, 'refs/tags/')
-      uses: actions/create-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
-        draft: false
-        prerelease: false
+      run: |
+        TAG_NAME=${GITHUB_REF#refs/tags/}
+        FILE_SIZE=$(du -h vaobs.exe | cut -f1)
+        cat > release_notes.md << EOF
+        Release $TAG_NAME
         
-    - name: Upload release asset
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./vaobs.exe
-        asset_name: vaobs.exe
-        asset_content_type: application/octet-stream
+        File Information:
+        - vaobs.exe: Windows executable (${FILE_SIZE})
+        
+        Installation:
+        Download the vaobs.exe file and run it directly on Windows in cmd. Use `--help` to see available commands.
+        EOF
+        gh release create "$TAG_NAME" vaobs.exe \
+          --title "VaOBS $TAG_NAME" \
+          --notes-file release_notes.md \
+          --verify-tag
