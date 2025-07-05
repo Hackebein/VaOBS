@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,11 +22,10 @@ var (
 	obsConnected = false
 
 	// Command line flags
-	obsHost            = flag.String("obs-host", "localhost", "OBS WebSocket host")
-	obsPort            = flag.Int("obs-port", 4455, "OBS WebSocket port")
-	obsPassword        = flag.String("obs-password", "", "OBS WebSocket password")
-	inputName          = flag.String("input-name", "VRChatFeed", "OBS input source name")
-	additionalSettings = flag.String("additional-settings", "hw_decode=true,close_when_inactive=true", "Additional input settings in format key1=value1,key2=value2")
+	obsHost     = flag.String("obs-host", "localhost", "OBS WebSocket host")
+	obsPort     = flag.Int("obs-port", 4455, "OBS WebSocket port")
+	obsPassword = flag.String("obs-password", "", "OBS WebSocket password")
+	inputName   = flag.String("input-name", "VRChatFeed", "OBS input source name")
 )
 
 func getLatestLogFile() (string, error) {
@@ -82,40 +80,6 @@ func connectToOBS() {
 	log.Printf("Connected to OBS WebSocket successfully at %s!", obsAddress)
 }
 
-func parseAdditionalSettings() map[string]interface{} {
-	settings := make(map[string]interface{})
-
-	if *additionalSettings == "" {
-		return settings
-	}
-
-	pairs := strings.Split(*additionalSettings, ",")
-	for _, pair := range pairs {
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) != 2 {
-			log.Printf("Invalid setting format: %s (expected key=value)", pair)
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		// Try to parse as different types
-		if parsedBool, err := strconv.ParseBool(value); err == nil {
-			settings[key] = parsedBool
-		} else if parsedInt, err := strconv.ParseInt(value, 10, 64); err == nil {
-			settings[key] = parsedInt
-		} else if parsedFloat, err := strconv.ParseFloat(value, 64); err == nil {
-			settings[key] = parsedFloat
-		} else {
-			// Store as string
-			settings[key] = value
-		}
-	}
-
-	return settings
-}
-
 func pushToOBS(url string) {
 	// Convert rtspt protocol to rtmp for streams
 	if strings.HasPrefix(url, "rtspt://") {
@@ -124,22 +88,24 @@ func pushToOBS(url string) {
 	}
 
 	if obsConnected {
-		// Create input settings
-		inputSettings := map[string]interface{}{}
+		// Get current input settings first
+		response, err := obsClient.Inputs.GetInputSettings(&inputs.GetInputSettingsParams{
+			InputName: inputName,
+		})
 
-		// Add additional settings
-		additionalSettings := parseAdditionalSettings()
-		for key, value := range additionalSettings {
-			inputSettings[key] = value
+		if err != nil {
+			log.Printf("Failed to get OBS input settings: %v", err)
+			return
 		}
+		inputSettings := response.InputSettings
+		log.Printf("Current OBS input settings for '%s': %v", *inputName, inputSettings)
 
-		// Set the URL
 		inputSettings["input"] = url
 		inputSettings["is_local_file"] = false
 
 		// Update the input settings
 		overlay := false
-		_, err := obsClient.Inputs.SetInputSettings(&inputs.SetInputSettingsParams{
+		_, err = obsClient.Inputs.SetInputSettings(&inputs.SetInputSettingsParams{
 			InputName:     inputName,
 			InputSettings: inputSettings,
 			Overlay:       &overlay,
@@ -168,7 +134,7 @@ func findLastURLInFile(filename string) string {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if matches := urlRegex.FindStringSubmatch(line); matches != nil && len(matches) > 1 {
+		if matches := urlRegex.FindStringSubmatch(line); len(matches) > 1 {
 			lastURL = matches[1]
 		}
 	}
@@ -214,7 +180,7 @@ func monitorLogFile(filename string, watcher *fsnotify.Watcher) {
 				scanner := bufio.NewScanner(file)
 				for scanner.Scan() {
 					line := scanner.Text()
-					if matches := urlRegex.FindStringSubmatch(line); matches != nil && len(matches) > 1 {
+					if matches := urlRegex.FindStringSubmatch(line); len(matches) > 1 {
 						url := matches[1]
 						pushToOBS(url)
 					}
@@ -238,9 +204,6 @@ func main() {
 	log.Printf("  OBS Host: %s", *obsHost)
 	log.Printf("  OBS Port: %d", *obsPort)
 	log.Printf("  Input Name: %s", *inputName)
-	if *additionalSettings != "" {
-		log.Printf("  Additional Settings: %s", *additionalSettings)
-	}
 
 	// Connect to OBS
 	connectToOBS()

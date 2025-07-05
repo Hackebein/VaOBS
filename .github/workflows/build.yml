@@ -58,12 +58,36 @@ jobs:
         FILE_SIZE=$(du -h vaobs.exe | cut -f1)
         cat > release_notes.md << EOF
         Release $TAG_NAME
+        VaOBS is a tool to capture a video playing inside of VRChat directly from OBS.
+
+        It's recommended to record VRChat's audio on a different track then the Media Source track in OBS, so you can shift the audio in post-processing if needed.
+
+        OBS Settings:
+        * Setup a Media Source in OBS, default name is "VRChatFeed"
+        * Settings must be set via launch parameters (additional settings).
+
+        \`OBS > Tools > WebSocket Server Settings\`
+        * Enable WebSocket server
+        * Enable Authentication
+        * Show Connection Info
+
+        Usage:
+        Download the vaobs.exe file and run it directly on Windows in cmd. Use \`--help\` to see available commands.
         
-        File Information:
-        - vaobs.exe: Windows executable (${FILE_SIZE})
-        
-        Installation:
-        Download the vaobs.exe file and run it directly on Windows in cmd. Use `--help` to see available commands.
+        \`\`\`shell
+        vaobs.exe --help
+        #Usage of vaobs.exe:
+        #  -additional-settings string
+        #        Additional input settings in format key1=value1,key2=value2 (default "hw_decode=true,close_when_inactive=true")
+        #  -input-name string
+        #        OBS input source name (default "VRChatFeed")
+        #  -obs-host string
+        #        OBS WebSocket host (default "localhost")
+        #  -obs-password string
+        #        OBS WebSocket password
+        #  -obs-port int
+        #        OBS WebSocket port (default 4455)
+        \`\`\`
         EOF
         gh release create "$TAG_NAME" vaobs.exe \
           --title "VaOBS $TAG_NAME" \
