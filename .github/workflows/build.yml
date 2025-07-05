@@ -64,7 +64,6 @@ jobs:
 
         OBS Settings:
         * Setup a Media Source in OBS, default name is "VRChatFeed"
-        * Settings must be set via launch parameters (additional settings).
 
         \`OBS > Tools > WebSocket Server Settings\`
         * Enable WebSocket server
