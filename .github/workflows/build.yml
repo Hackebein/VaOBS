@@ -54,13 +54,10 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        TAG_NAME=${GITHUB_REF#refs/tags/}
-        FILE_SIZE=$(du -h vaobs.exe | cut -f1)
         cat > release_notes.md << EOF
-        Release $TAG_NAME
-        VaOBS is a tool to capture a video playing inside of VRChat directly from OBS.
+        VaOBS is a tool to capture a video playing inside of VRChat directly from OBS as it's own media source.
 
-        It's recommended to record VRChat's audio on a different track then the Media Source track in OBS, so you can shift the audio in post-processing if needed.
+        It's recommended to record VRChat's audio on a different track then the Media Source track in OBS, so you can shift the audio in post-processing if needed. This is needed for non-low-latency video playbacks in VRChat, like YouTube videos or Twitch streams.
 
         OBS Settings:
         * Setup a Media Source in OBS, default name is "VRChatFeed"
@@ -76,8 +73,6 @@ jobs:
         \`\`\`shell
         vaobs.exe --help
         #Usage of vaobs.exe:
-        #  -additional-settings string
-        #        Additional input settings in format key1=value1,key2=value2 (default "hw_decode=true,close_when_inactive=true")
         #  -input-name string
         #        OBS input source name (default "VRChatFeed")
         #  -obs-host string
