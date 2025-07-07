@@ -44,6 +44,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        TAG_NAME=${GITHUB_REF#refs/tags/}
         cat > release_notes.md << EOF
         VaOBS is a tool to capture a video playing inside of VRChat directly from OBS as it's own media source.
 
