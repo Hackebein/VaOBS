@@ -29,4 +29,5 @@ vaobs.exe --help
 ```
 
 ## Support
+* [Create Ticket](https://github.com/Hackebein/VaOBS/issues/new)
 * [Hackebein's Research Lab](https://discord.gg/AqCwGqqQmW) at discord.gg
