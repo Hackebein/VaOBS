@@ -12,6 +12,11 @@ OBS Settings:
 * Enable Authentication
 * Show Connection Info
 
+OBS Example Scene:
+Application Audio Capture is in sync with Spout2 Capture. The Media Source can be slightly out of sync depending on the source, which is why it's keept on the 2nd Track. Allows later to adjust Track #2 to Track #1, to match Spout visiuals.
+
+![](docs/obs_example_scene.png)
+
 Usage:
 Download the vaobs.exe file and run it directly on Windows in cmd. Use `--help` to see available commands.
 
