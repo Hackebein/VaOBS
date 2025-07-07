@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/andreykaipov/goobs"
@@ -18,14 +20,16 @@ import (
 
 var (
 	urlRegex     = regexp.MustCompile(`\[Video Playback\] (?:URL.*resolved to '|Resolving URL ')([^']+)'`)
+	quitRegex    = regexp.MustCompile(`VRCApplication: HandleApplicationQuit|\[Behaviour\] Successfully left room`)
 	obsClient    *goobs.Client
 	obsConnected = false
 
 	// Command line flags
-	obsHost     = flag.String("obs-host", "localhost", "OBS WebSocket host")
-	obsPort     = flag.Int("obs-port", 4455, "OBS WebSocket port")
-	obsPassword = flag.String("obs-password", "", "OBS WebSocket password")
-	inputName   = flag.String("input-name", "VRChatFeed", "OBS input source name")
+	obsHost          = flag.String("obs-host", "localhost", "OBS WebSocket host")
+	obsPort          = flag.Int("obs-port", 4455, "OBS WebSocket port")
+	obsPassword      = flag.String("obs-password", "", "OBS WebSocket password")
+	inputName        = flag.String("input-name", "VRChatFeed", "OBS input source name")
+	rtsptReplacement = flag.String("rtspt-replacement", "rtmp", "Protocol to replace rtspt with")
 )
 
 func getLatestLogFile() (string, error) {
@@ -81,10 +85,10 @@ func connectToOBS() {
 }
 
 func pushToOBS(url string) {
-	// Convert rtspt protocol to rtmp for streams
+	// Convert rtspt protocol
 	if strings.HasPrefix(url, "rtspt://") {
-		url = strings.Replace(url, "rtspt://", "rtmp://", 1)
-		log.Printf("Converted rtspt to rtmp: %s", url)
+		url = strings.Replace(url, "rtspt://", *rtsptReplacement+"://", 1)
+		log.Printf("Converted rtspt to %s: %s", *rtsptReplacement, url)
 	}
 
 	if obsConnected {
@@ -98,8 +102,6 @@ func pushToOBS(url string) {
 			return
 		}
 		inputSettings := response.InputSettings
-		log.Printf("Current OBS input settings for '%s': %v", *inputName, inputSettings)
-
 		inputSettings["input"] = url
 		inputSettings["is_local_file"] = false
 
@@ -137,6 +139,9 @@ func findLastURLInFile(filename string) string {
 		if matches := urlRegex.FindStringSubmatch(line); len(matches) > 1 {
 			lastURL = matches[1]
 		}
+		if quitRegex.MatchString(line) {
+			lastURL = "" // Clear any previous URL
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -150,12 +155,7 @@ func findLastURLInFile(filename string) string {
 func monitorLogFile(filename string, watcher *fsnotify.Watcher) {
 	// Find and push the last URL from the existing log
 	lastURL := findLastURLInFile(filename)
-	if lastURL != "" {
-		log.Printf("Found last URL in log: %s", lastURL)
-		pushToOBS(lastURL)
-	} else {
-		log.Println("No previous URLs found in log")
-	}
+	pushToOBS(lastURL)
 
 	// Keep track of file position
 	file, err := os.Open(filename)
@@ -183,6 +183,8 @@ func monitorLogFile(filename string, watcher *fsnotify.Watcher) {
 					if matches := urlRegex.FindStringSubmatch(line); len(matches) > 1 {
 						url := matches[1]
 						pushToOBS(url)
+					} else if quitRegex.MatchString(line) {
+						pushToOBS("") // Clear OBS input on quit/leave
 					}
 				}
 			}
@@ -204,13 +206,30 @@ func main() {
 	log.Printf("  OBS Host: %s", *obsHost)
 	log.Printf("  OBS Port: %d", *obsPort)
 	log.Printf("  Input Name: %s", *inputName)
+	log.Printf("  Replace rtspt with: %v", *rtsptReplacement)
 
 	// Connect to OBS
 	connectToOBS()
 	defer func() {
 		if obsConnected {
+			// Clear OBS input before disconnecting
+			pushToOBS("")
 			obsClient.Disconnect()
 		}
+	}()
+
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Handle graceful shutdown in a goroutine
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal, clearing OBS input...")
+		if obsConnected {
+			pushToOBS("")
+		}
+		os.Exit(0)
 	}()
 
 	// Get initial log file
