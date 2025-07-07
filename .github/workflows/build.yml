@@ -63,14 +63,16 @@ jobs:
         \`\`\`shell
         vaobs.exe --help
         #Usage of vaobs.exe:
-        #  -input-name string
-        #        OBS input source name (default "VRChatFeed")
-        #  -obs-host string
-        #        OBS WebSocket host (default "localhost")
-        #  -obs-password string
-        #        OBS WebSocket password
-        #  -obs-port int
-        #        OBS WebSocket port (default 4455)
+        #-input-name string
+        #      OBS input source name (default "VRChatFeed")
+        #-obs-host string
+        #      OBS WebSocket host (default "localhost")
+        #-obs-password string
+        #      OBS WebSocket password
+        #-obs-port int
+        #      OBS WebSocket port (default 4455)
+        #-rtspt-replacement string
+        #      Protocol to replace rtspt with (default "rtmp")
         \`\`\`
         EOF
         gh release create "$TAG_NAME" vaobs.exe \
