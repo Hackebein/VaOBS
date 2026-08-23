@@ -115,6 +115,7 @@ func pushToOBS(url string) {
 		inputSettings := response.InputSettings
 		inputSettings["input"] = url
 		inputSettings["is_local_file"] = false
+		inputSettings["seekable"] = false
 
 		// Update the input settings
 		overlay := false
