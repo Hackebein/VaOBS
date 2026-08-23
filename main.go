@@ -33,16 +33,22 @@ var (
 	rtsptReplacement = flag.String("rtspt-replacement", "rtmp", "Protocol to replace rtspt with")
 )
 
-func getLatestLogFile() (string, error) {
+func getVRChatLogDir() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 
-	logDir := filepath.Join(homeDir, "AppData", "LocalLow", "VRChat", "VRChat")
-	pattern := filepath.Join(logDir, "output_log_*.txt")
+	return filepath.Join(homeDir, "AppData", "LocalLow", "VRChat", "VRChat"), nil
+}
 
-	files, err := filepath.Glob(pattern)
+func getLatestLogFile() (string, error) {
+	logDir, err := getVRChatLogDir()
+	if err != nil {
+		return "", err
+	}
+
+	files, err := filepath.Glob(filepath.Join(logDir, "output_log_*.txt"))
 	if err != nil {
 		return "", err
 	}
@@ -65,6 +71,10 @@ func getLatestLogFile() (string, error) {
 			latestTime = info.ModTime()
 			latestFile = file
 		}
+	}
+
+	if latestFile == "" {
+		return "", fmt.Errorf("unable to find VRChat log files")
 	}
 
 	return latestFile, nil
@@ -250,9 +260,20 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// TODO: Temporary watcher to keep fsnotify imported, use it for getting latest log file
+	logDir, err := getVRChatLogDir()
+	if err != nil {
+		log.Fatalf("Error finding VRChat log directory: %v", err)
+	}
+
 	watcher, err := fsnotify.NewWatcher()
-	watcher.Close()
+	if err != nil {
+		log.Fatalf("Error creating file watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(logDir); err != nil {
+		log.Fatalf("Error watching VRChat log directory: %v", err)
+	}
 
 	// Get initial log file
 	currentLogFile, err := getLatestLogFile()
@@ -277,33 +298,50 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Check for new log files periodically
-	checkInterval := 5 * time.Second
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
 	for {
 		select {
-		case <-ticker.C:
-			latestLog, err := getLatestLogFile()
-			if err != nil {
-				log.Printf("Error checking for new log files: %v", err)
+		case <-sigChan:
+			log.Println("Received shutdown signal, clearing OBS input...")
+			close(stopChan)
+			pushToOBS("")
+			return
+
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+
+			baseName := filepath.Base(event.Name)
+			isLogFile, _ := filepath.Match("output_log_*.txt", baseName)
+			if !isLogFile {
 				continue
 			}
 
-			if latestLog != currentLogFile {
-				log.Printf("New log file detected: %s", latestLog)
-				log.Println("Switching to monitor new log file...")
-				currentLogFile = latestLog
+			if event.Op&(fsnotify.Write) == 0 {
+				continue
+			}
 
-				// Restart the monitoring goroutine
-				close(stopChan)
-				stopChan = make(chan struct{})
+			latestLog, err := getLatestLogFile()
+			if err != nil {
+				log.Printf("Error checking latest log file: %v", err)
+				continue
+			}
 
-				log.Printf("Now monitoring: %s", currentLogFile)
+			if latestLog == currentLogFile {
+				continue
+			}
 
-				// Start monitoring new file
-				go monitorLogFile(currentLogFile, stopChan)
+			log.Printf("New latest log file detected: %s", latestLog)
+
+			close(stopChan)
+			stopChan = make(chan struct{})
+			currentLogFile = latestLog
+
+			go monitorLogFile(currentLogFile, stopChan)
+
+		case err, ok := <-watcher.Errors:
+			if ok {
+				log.Printf("File watcher error: %v", err)
 			}
 		}
 	}
