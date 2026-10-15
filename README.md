@@ -1,38 +1,50 @@
-# VaOBS - VRChat OBS Video Capture Tool
+# VaOBS
 
-VaOBS is a tool to capture a video playing inside of VRChat directly from OBS as it's own media source.
+A Windows tray app that captures videos playing in VRChat through OBS and
+automatically delays the clean audio to match VRChat during recording.
 
-It's recommended to record VRChat's audio on a different track then the Media Source track in OBS, so you can shift the audio in post-processing if needed. This is needed for non-low-latency video playbacks in VRChat, like YouTube videos or Twitch streams.
+## Setup
 
-OBS Settings:
-* Setup a Media Source in OBS, default name is "VRChatFeed"
+1. Use Windows x64 and OBS 32.2.2 or newer. Extract the release ZIP, close OBS,
+   run `install-plugin.ps1` in PowerShell (as administrator if needed), then restart OBS.
+2. Add a Media Source on recording track 2 and VRChat application audio capture
+   on track 1. Enable authentication under **Tools → WebSocket Server Settings**.
+3. Double-click `vaobs.exe`. Settings opens on first launch. Enter your OBS host,
+   port, password, and source names, then click **Save**. The defaults are
+   `VRChatFeed` (source to sync) and `VRChatAudio` (timing reference).
 
-`OBS > Tools > WebSocket Server Settings`
-* Enable WebSocket server
-* Enable Authentication
-* Show Connection Info
+Open **Settings** from the tray icon to make changes. VaOBS saves them, reconnects
+when OBS becomes available, and protects the saved OBS password with Windows.
 
-OBS Example Scene:
-Application Audio Capture is in sync with Spout2 Capture. The Media Source can be slightly out of sync depending on the source, which is why it's keept on the 2nd Track. Allows later to adjust Track #2 to Track #1, to match Spout visiuals.
+VaOBS creates its delayed output automatically on the media feed's recording
+tracks and mutes the original feed audio. It keeps the same two recording tracks.
+Wait for **Aligned** in the generated source's Properties before recording; a 21-second delay
+needs about 27 seconds of shared audio to calibrate. Timing changes take several
+seconds to follow. For other scenes, add the existing aligned source and keep
+the feed active.
 
-![](docs/obs_example_scene.png)
+The tray menu also provides **Reconnect**, **Open log**, and **Quit**. To restore
+original audio, mute the aligned output and unmute the media feed.
 
-Usage:
-Download the vaobs.exe file and run it directly on Windows in cmd. Use `--help` to see available commands.
+![Example OBS scene](assets/obs_example_scene.png)
 
-```shell
-vaobs.exe --help
-#Usage of vaobs.exe:
-#  -input-name string
-#        OBS input source name (default "VRChatFeed")
-#  -obs-host string
-#        OBS WebSocket host (default "localhost")
-#  -obs-password string
-#        OBS WebSocket password
-#  -obs-port int
-#        OBS WebSocket port (default 4455)
+## Build
+
+The Go app is in `cmd/vaobs`; the C++ plugin, tests, and replay tool are in
+`obs-plugin`. With Go 1.24+, Git, and PowerShell, run:
+
+```powershell
+.\scripts\build-windows.ps1
 ```
 
+The script builds and tests the Windows ZIP in `dist`. Add `-ObsBinPath` with
+your OBS `bin\64bit` directory to run the OBS audio test too.
+
+## License
+
+[GPL-2.0-or-later](LICENSE). Original and third-party notices are retained.
+
 ## Support
-* [Create Ticket](https://github.com/Hackebein/VaOBS/issues/new)
-* [Hackebein's Research Lab](https://discord.gg/AqCwGqqQmW) at discord.gg
+
+[Report an issue](https://github.com/Hackebein/VaOBS/issues/new) ·
+[Hackebein's Research Lab](https://discord.gg/AqCwGqqQmW)

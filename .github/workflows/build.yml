@@ -1,82 +1,65 @@
-name: Build Executable
+name: Build and test Windows bundle
 
 on:
+  pull_request:
+    branches: [ main ]
   push:
     branches: [ main ]
     tags: [ 'v*' ]
 
 permissions:
-  contents: write  # Required for creating releases
+  contents: write
 
 jobs:
   build-windows:
-    runs-on: ubuntu-latest
-    
+    runs-on: windows-latest
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.24'
-          
-    - name: Download dependencies
-      run: go mod download
-      
-    - name: Build for Windows
-      env:
-        GOOS: windows
-        GOARCH: amd64
-        CGO_ENABLED: 0
-      run: |
-        go build -v -ldflags="-s -w" -o vaobs.exe .
-        
-    - name: Upload Windows executable
-      uses: actions/upload-artifact@v4
-      with:
-        name: vaobs-windows-executable
-        path: vaobs.exe
-        retention-days: 30
-        
-    - name: Create release on tag
-      if: startsWith(github.ref, 'refs/tags/')
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        TAG_NAME=${GITHUB_REF#refs/tags/}
-        cat > release_notes.md << EOF
-        VaOBS is a tool to capture a video playing inside of VRChat directly from OBS as it's own media source.
+      - uses: actions/checkout@v4
 
-        It's recommended to record VRChat's audio on a different track then the Media Source track in OBS, so you can shift the audio in post-processing if needed. This is needed for non-low-latency video playbacks in VRChat, like YouTube videos or Twitch streams.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
 
-        OBS Settings:
-        * Setup a Media Source in OBS, default name is "VRChatFeed"
+      - name: Cache native toolchain and OBS runtime
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build/toolchain
+            .build/obs-sdk
+            .build/obs-runtime
+          key: windows-zig-0.17.0-obs-32.2.2
 
-        \`OBS > Tools > WebSocket Server Settings\`
-        * Enable WebSocket server
-        * Enable Authentication
-        * Show Connection Info
+      - name: Download official OBS runtime for integration tests
+        shell: pwsh
+        run: |
+          if (-not (Test-Path '.build/obs-runtime/bin/64bit/obs.dll')) {
+            New-Item -ItemType Directory -Force -Path '.build' | Out-Null
+            Invoke-WebRequest -Uri 'https://github.com/obsproject/obs-studio/releases/download/32.2.2/OBS-Studio-32.2.2-Windows-x64.zip' -OutFile '.build/obs-runtime.zip'
+            $expected = '4d6e40e3ab155f56b30de517380566a206d74b63cdf5ad49aa596924768f97e1'
+            if ((Get-FileHash -Algorithm SHA256 '.build/obs-runtime.zip').Hash -ne $expected) {
+              throw 'OBS runtime checksum mismatch'
+            }
+            Expand-Archive -LiteralPath '.build/obs-runtime.zip' -DestinationPath '.build/obs-runtime' -Force
+          }
 
-        Usage:
-        Download the vaobs.exe file and run it directly on Windows in cmd. Use \`--help\` to see available commands.
-        
-        \`\`\`shell
-        vaobs.exe --help
-        #Usage of vaobs.exe:
-        #-input-name string
-        #      OBS input source name (default "VRChatFeed")
-        #-obs-host string
-        #      OBS WebSocket host (default "localhost")
-        #-obs-password string
-        #      OBS WebSocket password
-        #-obs-port int
-        #      OBS WebSocket port (default 4455)
-        #-rtspt-replacement string
-        #      Protocol to replace rtspt with (default "rtmp")
-        \`\`\`
-        EOF
-        gh release create "$TAG_NAME" vaobs.exe \
-          --title "VaOBS $TAG_NAME" \
-          --notes-file release_notes.md \
-          --verify-tag
+      - name: Build, test, and package
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -ObsBinPath '.build/obs-runtime/bin/64bit'
+
+      - name: Upload Windows release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaobs-windows-live-alignment
+          path: |
+            dist/vaobs.exe
+            dist/vaobs-audio-align.dll
+            dist/vaobs-windows-live-alignment.zip
+          retention-days: 30
+
+      - name: Create release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME dist/vaobs.exe dist/vaobs-windows-live-alignment.zip --title "VaOBS $env:GITHUB_REF_NAME" --notes-file README.md --verify-tag
