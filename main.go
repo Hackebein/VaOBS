@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -32,16 +33,22 @@ var (
 	rtsptReplacement = flag.String("rtspt-replacement", "rtmp", "Protocol to replace rtspt with")
 )
 
-func getLatestLogFile() (string, error) {
+func getVRChatLogDir() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 
-	logDir := filepath.Join(homeDir, "AppData", "LocalLow", "VRChat", "VRChat")
-	pattern := filepath.Join(logDir, "output_log_*.txt")
+	return filepath.Join(homeDir, "AppData", "LocalLow", "VRChat", "VRChat"), nil
+}
 
-	files, err := filepath.Glob(pattern)
+func getLatestLogFile() (string, error) {
+	logDir, err := getVRChatLogDir()
+	if err != nil {
+		return "", err
+	}
+
+	files, err := filepath.Glob(filepath.Join(logDir, "output_log_*.txt"))
 	if err != nil {
 		return "", err
 	}
@@ -64,6 +71,10 @@ func getLatestLogFile() (string, error) {
 			latestTime = info.ModTime()
 			latestFile = file
 		}
+	}
+
+	if latestFile == "" {
+		return "", fmt.Errorf("unable to find VRChat log files")
 	}
 
 	return latestFile, nil
@@ -104,6 +115,7 @@ func pushToOBS(url string) {
 		inputSettings := response.InputSettings
 		inputSettings["input"] = url
 		inputSettings["is_local_file"] = false
+		inputSettings["seekable"] = false
 
 		// Update the input settings
 		overlay := false
@@ -152,50 +164,77 @@ func findLastURLInFile(filename string) string {
 	return lastURL
 }
 
-func monitorLogFile(filename string, watcher *fsnotify.Watcher) {
+func monitorLogFile(filename string, stopChan chan struct{}) {
+	log.Printf("Gopher spawned: Monitoring content of %s", filepath.Base(filename))
+
 	// Find and push the last URL from the existing log
 	lastURL := findLastURLInFile(filename)
 	pushToOBS(lastURL)
 
-	// Keep track of file position
-	file, err := os.Open(filename)
+	// Establish initial file bounds
+	info, err := os.Stat(filename)
 	if err != nil {
-		log.Printf("Error opening log file: %v", err)
+		log.Printf("Error reading log file: %v", err)
 		return
 	}
-	defer file.Close()
+	lastSize := info.Size()
 
-	// Seek to end of file to only read new content
-	file.Seek(0, 2)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
+		case <-stopChan:
+			log.Printf("Stopping monitor goroutine for: %s", filepath.Base(filename))
+			return
+		case <-ticker.C:
+			fi, err := os.Stat(filename)
+			if err != nil {
+				continue
 			}
 
-			if event.Op&fsnotify.Write == fsnotify.Write {
-				// Read new content from file
-				scanner := bufio.NewScanner(file)
-				for scanner.Scan() {
-					line := scanner.Text()
-					if matches := urlRegex.FindStringSubmatch(line); len(matches) > 1 {
-						url := matches[1]
-						pushToOBS(url)
-					} else if quitRegex.MatchString(line) {
-						pushToOBS("") // Clear OBS input on quit/leave
-					}
+			currentSize := fi.Size()
+			if currentSize < lastSize {
+				// File was truncated or reset
+				lastSize = 0
+			}
+
+			if currentSize > lastSize {
+				err := readAndProcessNewContent(filename, lastSize, currentSize)
+				if err == nil {
+					lastSize = currentSize
+				} else {
+					log.Printf("Error processing updates: %v", err)
 				}
 			}
-
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("Watcher error: %v", err)
 		}
 	}
+}
+
+func readAndProcessNewContent(filename string, offset, currentSize int64) error {
+	file, err := os.OpenFile(filename, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = file.Seek(offset, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	// Only read exactly what was added since our last check
+	scanner := bufio.NewScanner(io.LimitReader(file, currentSize-offset))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if matches := urlRegex.FindStringSubmatch(line); len(matches) > 1 {
+			url := matches[1]
+			pushToOBS(url)
+		} else if quitRegex.MatchString(line) {
+			pushToOBS("") // Clear OBS input on quit/leave
+		}
+	}
+	return scanner.Err()
 }
 
 func main() {
@@ -222,15 +261,20 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Handle graceful shutdown in a goroutine
-	go func() {
-		<-sigChan
-		log.Println("Received shutdown signal, clearing OBS input...")
-		if obsConnected {
-			pushToOBS("")
-		}
-		os.Exit(0)
-	}()
+	logDir, err := getVRChatLogDir()
+	if err != nil {
+		log.Fatalf("Error finding VRChat log directory: %v", err)
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("Error creating file watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(logDir); err != nil {
+		log.Fatalf("Error watching VRChat log directory: %v", err)
+	}
 
 	// Get initial log file
 	currentLogFile, err := getLatestLogFile()
@@ -240,55 +284,65 @@ func main() {
 
 	log.Printf("Monitoring VRChat log file: %s", currentLogFile)
 
-	// Create file watcher
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatalf("Error creating file watcher: %v", err)
-	}
-	defer watcher.Close()
+	// Start monitoring in a goroutine with a stop channel
+	stopChan := make(chan struct{})
+	go monitorLogFile(currentLogFile, stopChan)
 
-	// Add the log file to watcher
-	err = watcher.Add(currentLogFile)
-	if err != nil {
-		log.Fatalf("Error adding file to watcher: %v", err)
-	}
-
-	// Start monitoring in a goroutine
-	go monitorLogFile(currentLogFile, watcher)
-
-	// Check for new log files periodically
-	checkInterval := 5 * time.Second
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
+	// Handle graceful shutdown in a goroutine
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal, clearing OBS input...")
+		close(stopChan)
+		if obsConnected {
+			pushToOBS("")
+		}
+		os.Exit(0)
+	}()
 
 	for {
 		select {
-		case <-ticker.C:
-			latestLog, err := getLatestLogFile()
-			if err != nil {
-				log.Printf("Error checking for new log files: %v", err)
+		case <-sigChan:
+			log.Println("Received shutdown signal, clearing OBS input...")
+			close(stopChan)
+			pushToOBS("")
+			return
+
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+
+			baseName := filepath.Base(event.Name)
+			isLogFile, _ := filepath.Match("output_log_*.txt", baseName)
+			if !isLogFile {
 				continue
 			}
 
-			if latestLog != currentLogFile {
-				log.Printf("New log file detected: %s", latestLog)
-				log.Println("Switching to monitor new log file...")
+			if event.Op&(fsnotify.Write) == 0 {
+				continue
+			}
 
-				// Remove old file from watcher
-				watcher.Remove(currentLogFile)
+			latestLog, err := getLatestLogFile()
+			if err != nil {
+				log.Printf("Error checking latest log file: %v", err)
+				continue
+			}
 
-				// Add new file to watcher
-				err = watcher.Add(latestLog)
-				if err != nil {
-					log.Printf("Error adding new file to watcher: %v", err)
-					continue
-				}
+			if latestLog == currentLogFile {
+				continue
+			}
 
-				currentLogFile = latestLog
-				log.Printf("Now monitoring: %s", currentLogFile)
+			log.Printf("New latest log file detected: %s", latestLog)
 
-				// Start monitoring new file
-				go monitorLogFile(currentLogFile, watcher)
+			close(stopChan)
+			stopChan = make(chan struct{})
+			currentLogFile = latestLog
+
+			go monitorLogFile(currentLogFile, stopChan)
+
+		case err, ok := <-watcher.Errors:
+			if ok {
+				log.Printf("File watcher error: %v", err)
 			}
 		}
 	}
