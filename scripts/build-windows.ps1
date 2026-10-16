@@ -1,7 +1,8 @@
 param(
     [string]$ZigPath,
     [string]$ObsSourcePath,
-    [string]$ObsBinPath
+    [string]$ObsBinPath,
+    [string]$Version = 'dev'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +10,8 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BuildRoot = Join-Path $ProjectRoot '.build'
 $DistRoot = Join-Path $ProjectRoot 'dist'
 New-Item -ItemType Directory -Force -Path $BuildRoot, $DistRoot | Out-Null
+if ($Version -notmatch '^(dev|v?\d+\.\d+(\.\d+)?(-[0-9A-Za-z.-]+)?)$') { throw 'Use dev or a release version such as 2.0.0' }
+$Version = $Version -replace '^v', ''
 
 function Assert-Exit([string]$Action) {
     if ($LASTEXITCODE -ne 0) { throw "$Action failed with exit code $LASTEXITCODE" }
@@ -55,6 +58,27 @@ New-Item -ItemType Directory -Force -Path $IncludeRoot | Out-Null
 #define OBS_BETA 0
 '@ | Set-Content -LiteralPath (Join-Path $IncludeRoot 'obsconfig.h') -Encoding utf8
 
+# Identify local builds by their actual source, including uncommitted changes.
+$SourceDigest = [System.IO.MemoryStream]::new()
+try {
+    $VersionBytes = [System.Text.Encoding]::UTF8.GetBytes($Version)
+    $SourceDigest.Write($VersionBytes, 0, $VersionBytes.Length)
+    foreach ($Tree in @('src', 'tests', 'scripts', '.github')) {
+        foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $ProjectRoot $Tree) -Recurse -File | Sort-Object FullName)) {
+            $Name = [System.Text.Encoding]::UTF8.GetBytes($File.FullName.Substring($ProjectRoot.Length).Replace('\', '/'))
+            $Bytes = [System.IO.File]::ReadAllBytes($File.FullName)
+            $SourceDigest.Write($Name, 0, $Name.Length); $SourceDigest.WriteByte(0)
+            $SourceDigest.Write($Bytes, 0, $Bytes.Length); $SourceDigest.WriteByte(0)
+        }
+    }
+    $BuildId = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($SourceDigest.ToArray())).Substring(0, 12).ToLowerInvariant()
+} finally { $SourceDigest.Dispose() }
+@"
+#pragma once
+#define VAOBS_VERSION "$Version"
+#define VAOBS_BUILD_ID "$BuildId"
+"@ | Set-Content -LiteralPath (Join-Path $IncludeRoot 'build-version.hpp') -Encoding ascii
+
 Push-Location $ProjectRoot
 try {
     $Common = @('c++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-target', 'x86_64-windows-gnu', '-I', 'src')
@@ -67,8 +91,9 @@ try {
     Assert-Exit 'Log test build'
     & (Join-Path $BuildRoot 'logs-test.exe')
     Assert-Exit 'Log tests'
-    & $ZigPath @Common @SDK -shared 'src/plugin.cpp' '-Wl,--export-all-symbols' -o (Join-Path $DistRoot 'vaobs-audio-align.dll')
+    & $ZigPath @Common @SDK -shared 'src/plugin.cpp' '-Wl,--export-all-symbols' '-lole32' -o (Join-Path $DistRoot 'vaobs-audio-align.dll')
     Assert-Exit 'OBS plugin build'
+    & (Join-Path $PSScriptRoot 'build-dock.ps1') -ZigPath $ZigPath -ObsBinPath $ObsBinPath
     & $ZigPath @Common @SDK 'tests/obs_integration_test.cpp' -o (Join-Path $BuildRoot 'obs-integration-test.exe')
     Assert-Exit 'OBS integration test build'
     & $ZigPath @Common @SDK 'tests/obs_control_test.cpp' -o (Join-Path $BuildRoot 'obs-control-test.exe')
@@ -84,8 +109,12 @@ try {
     $PluginBin = Join-Path $PackageRoot 'obs-plugin\vaobs-audio-align\bin\64bit'
     New-Item -ItemType Directory -Force -Path $PluginBin, (Join-Path $PackageRoot 'licenses') | Out-Null
     Copy-Item -LiteralPath (Join-Path $DistRoot 'vaobs-audio-align.dll') -Destination $PluginBin
+    Copy-Item -LiteralPath (Join-Path $DistRoot 'vaobs-dock.dll') -Destination $PluginBin
+    @{version=$Version; build=$BuildId; architecture='windows-x64'; obs='32.2.2'; files=@{
+        'vaobs-audio-align.dll'=(Get-FileHash -LiteralPath (Join-Path $PluginBin 'vaobs-audio-align.dll')).Hash.ToLowerInvariant()
+        'vaobs-dock.dll'=(Get-FileHash -LiteralPath (Join-Path $PluginBin 'vaobs-dock.dll')).Hash.ToLowerInvariant()
+    }} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $PackageRoot 'build-info.json') -Encoding utf8
     Copy-Item -LiteralPath (Join-Path $ProjectRoot 'README.md'), (Join-Path $ProjectRoot 'LICENSE') -Destination $PackageRoot
-    Copy-Item -LiteralPath (Join-Path $ProjectRoot 'scripts\install-plugin.ps1') -Destination $PackageRoot
     $ZigRoot = Split-Path -Parent $ZigPath
     Copy-Item -LiteralPath (Join-Path $ZigRoot 'lib\libcxx\LICENSE.TXT') -Destination (Join-Path $PackageRoot 'licenses\LLVM-runtime.txt')
 
@@ -102,8 +131,11 @@ try {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
         Copy-Item -LiteralPath $File.FullName -Destination $Destination
     }
-    $ZipPath = Join-Path $DistRoot 'vaobs-windows-live-alignment.zip'
+    $PackageName = if ($Version -eq 'dev') { "vaobs-dev-$BuildId-windows-x64" } else { "vaobs-$Version-windows-x64" }
+    $ZipPath = Join-Path $DistRoot ($PackageName + '.zip')
     Compress-Archive -Path (Join-Path $PackageRoot '*') -DestinationPath $ZipPath -Force
+    ((Get-FileHash -LiteralPath $ZipPath).Hash.ToLowerInvariant() + ' *' + (Split-Path -Leaf $ZipPath)) |
+        Set-Content -LiteralPath (Join-Path $DistRoot ($PackageName + '.sha256')) -Encoding ascii
     Write-Output "Built $ZipPath"
 } finally {
     Pop-Location
