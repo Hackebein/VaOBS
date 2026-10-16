@@ -3,12 +3,6 @@
 An audio-only OBS plugin that reads video URLs from VRChat logs, plays their audio,
 and automatically aligns it with VRChat for recording.
 
-After initial alignment, VaOBS follows timing drift with gradual, pitch-preserving
-tempo correction. It holds the last trusted timing during silence or temporary
-matching loss. Confirmed large timing jumps use a short crossfade. Hover over the
-dock status or open the source properties to see playback speed and the remaining
-timing correction.
-
 ## Setup
 
 Requires Windows x64 and OBS Studio (tested with OBS 32.2.2).
