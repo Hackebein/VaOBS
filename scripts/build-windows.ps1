@@ -46,6 +46,26 @@ $ObsRevision = & git -C $ObsSourcePath rev-parse HEAD
 Assert-Exit 'OBS SDK revision check'
 if ($ObsRevision -ne 'ba2f32bdf791005443988a4955e963663e16b1ed') { throw 'Expected OBS SDK 32.2.2 at the pinned revision' }
 
+# Build the pitch-preserving processor into the plugin; no runtime DLL or
+# changes to OBS's Media Source settings are required.
+$RubberBandRevision = '1d95888bec3ae0a17c0c4af791810d5a63f6bc35' # v4.0.0
+$RubberBandArchive = Join-Path $BuildRoot 'rubberband.zip'
+$BundledRubberBand = Join-Path $ProjectRoot 'third-party\rubberband.zip'
+if (Test-Path -LiteralPath $BundledRubberBand) { Copy-Item -LiteralPath $BundledRubberBand -Destination $RubberBandArchive -Force }
+if (-not (Test-Path -LiteralPath $RubberBandArchive)) {
+    Invoke-WebRequest -Uri "https://codeload.github.com/breakfastquay/rubberband/zip/$RubberBandRevision" -OutFile $RubberBandArchive
+}
+if ((Get-FileHash -LiteralPath $RubberBandArchive).Hash -ne '19ad83ba3d2e80ec910a1db309ea8c036073ef9b398654aa5e7e5c778eea3193') {
+    throw 'Rubber Band source archive checksum mismatch'
+}
+$RubberBandRoot = Join-Path $BuildRoot "rubberband-$RubberBandRevision"
+if (-not (Test-Path -LiteralPath (Join-Path $RubberBandRoot 'single\RubberBandSingle.cpp'))) {
+    Expand-Archive -LiteralPath $RubberBandArchive -DestinationPath $BuildRoot -Force
+}
+$RubberBandObject = Join-Path $BuildRoot 'rubberband.obj'
+& $ZigPath c++ -std=c++17 -O2 -DNDEBUG -target x86_64-windows-gnu -I (Join-Path $RubberBandRoot 'src') -c (Join-Path $RubberBandRoot 'single\RubberBandSingle.cpp') -o $RubberBandObject
+Assert-Exit 'Rubber Band build'
+
 $IncludeRoot = Join-Path $BuildRoot 'include'
 New-Item -ItemType Directory -Force -Path $IncludeRoot | Out-Null
 @'
@@ -83,22 +103,31 @@ Push-Location $ProjectRoot
 try {
     $Common = @('c++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-target', 'x86_64-windows-gnu', '-I', 'src')
     $SDK = @('-D_M_X64', '-I', (Join-Path $ObsSourcePath 'libobs'), '-I', $IncludeRoot)
+    $Playback = @('-I', $RubberBandRoot, $RubberBandObject)
     & $ZigPath @Common 'tests/alignment_test.cpp' -o (Join-Path $BuildRoot 'alignment-test.exe')
     Assert-Exit 'Alignment test build'
     & (Join-Path $BuildRoot 'alignment-test.exe')
     Assert-Exit 'Alignment tests'
+    & $ZigPath @Common @Playback 'tests/playback_test.cpp' -o (Join-Path $BuildRoot 'playback-test.exe')
+    Assert-Exit 'Continuous playback test build'
+    & (Join-Path $BuildRoot 'playback-test.exe')
+    Assert-Exit 'Continuous playback tests'
     & $ZigPath @Common 'tests/logs_test.cpp' -o (Join-Path $BuildRoot 'logs-test.exe')
     Assert-Exit 'Log test build'
     & (Join-Path $BuildRoot 'logs-test.exe')
     Assert-Exit 'Log tests'
-    & $ZigPath @Common @SDK -shared 'src/plugin.cpp' '-Wl,--export-all-symbols' '-lole32' -o (Join-Path $DistRoot 'vaobs-audio-align.dll')
+    & $ZigPath @Common @SDK @Playback -shared 'src/plugin.cpp' '-Wl,--export-all-symbols' '-lole32' -o (Join-Path $DistRoot 'vaobs-audio-align.dll')
     Assert-Exit 'OBS plugin build'
     & (Join-Path $PSScriptRoot 'build-dock.ps1') -ZigPath $ZigPath -ObsBinPath $ObsBinPath
     & $ZigPath @Common @SDK 'tests/obs_integration_test.cpp' -o (Join-Path $BuildRoot 'obs-integration-test.exe')
     Assert-Exit 'OBS integration test build'
     & $ZigPath @Common @SDK 'tests/obs_control_test.cpp' -o (Join-Path $BuildRoot 'obs-control-test.exe')
     Assert-Exit 'OBS playback test build'
+    & $ZigPath @Common @SDK 'tests/reference_test.cpp' -o (Join-Path $BuildRoot 'reference-test.exe')
+    Assert-Exit 'OBS reference lifecycle test build'
     if ($ObsBinPath) {
+        & (Join-Path $BuildRoot 'reference-test.exe') (Resolve-Path -LiteralPath $ObsBinPath).Path (Join-Path $DistRoot 'vaobs-audio-align.dll')
+        Assert-Exit 'Real OBS hidden-reference lifecycle test'
         & (Join-Path $BuildRoot 'obs-control-test.exe') (Resolve-Path -LiteralPath $ObsBinPath).Path (Join-Path $DistRoot 'vaobs-audio-align.dll')
         Assert-Exit 'Real OBS playback and source management test'
         & (Join-Path $BuildRoot 'obs-integration-test.exe') (Resolve-Path -LiteralPath $ObsBinPath).Path (Join-Path $DistRoot 'vaobs-audio-align.dll')
@@ -117,9 +146,12 @@ try {
     Copy-Item -LiteralPath (Join-Path $ProjectRoot 'README.md'), (Join-Path $ProjectRoot 'LICENSE') -Destination $PackageRoot
     $ZigRoot = Split-Path -Parent $ZigPath
     Copy-Item -LiteralPath (Join-Path $ZigRoot 'lib\libcxx\LICENSE.TXT') -Destination (Join-Path $PackageRoot 'licenses\LLVM-runtime.txt')
+    Copy-Item -LiteralPath (Join-Path $RubberBandRoot 'COPYING') -Destination (Join-Path $PackageRoot 'licenses\Rubber-Band.txt')
 
     # Include corresponding source and build instructions with the plugin.
     $SourceRoot = Join-Path $PackageRoot 'source'
+    New-Item -ItemType Directory -Force -Path (Join-Path $SourceRoot 'third-party') | Out-Null
+    Copy-Item -LiteralPath $RubberBandArchive -Destination (Join-Path $SourceRoot 'third-party\rubberband.zip')
     # An extracted source ZIP must also build without a Git working tree.
     $SourceFiles = @('README.md', 'LICENSE', '.gitignore') | ForEach-Object { Get-Item -LiteralPath (Join-Path $ProjectRoot $_) }
     foreach ($Tree in @('src', 'tests', 'scripts', '.github')) {

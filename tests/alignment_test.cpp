@@ -67,7 +67,7 @@ int main()
     Match changed{21198.5, .99, 2, true};
     observe(changed); require(lock.delay_ms == 21149, "single timing jump must be confirmed");
     observe(changed); require(lock.delay_ms == 21198.5, "confirmed timing jump updates delay");
-    for (int i = 0; i < 9; ++i) observe({});
+    for (int i = 0; i < 29; ++i) observe({});
     require(lock.locked, "short confidence loss holds the previous delay");
     observe({}); require(!lock.locked, "sustained confidence loss mutes until recalibration");
     lock.reset(); require(!lock.locked && lock.delay_ms == 0, "stream change resets alignment");
@@ -115,9 +115,46 @@ int main()
     require(!weak.locked, "Missing or rejected audio breaks the weak confirmation sequence");
     weak.observe(quiet_match, 60000, 12000, true);
     require(weak.locked, "Fresh independent evidence can confirm after an interruption");
-    for (int64_t time = 61000; time < 71000; time += 1000)
+    for (int64_t time = 61000; time < 91000; time += 1000)
         weak.observe({12000, .94, 1.8, true}, time, 12000, true);
-    require(!weak.locked, "An unconfirmed weak timing jump eventually mutes the old delay");
+    require(weak.locked && weak.delay_ms == 12000, "A consistent weak timing jump confirms while established audio stays playing");
+
+    Lock tracking;
+    tracking.observe(strong, 4000, 4000, true);
+    tracking.observe(strong, 5000, 4000, true);
+    for (int64_t t = 6000; t <= 30000; t += 1000) {
+        tracking.observe({21149 + (t - 5000) * .002, .9, 1.5, true}, t, 4000, true);
+        require(tracking.locked, "Continuous weak drift tracks without reacquiring or muting");
+    }
+    require(std::abs(tracking.delay_at(30000) - 21203) < 1,
+        "Drift prediction accounts for the analysis window's midpoint");
+    for (int64_t t = 31000; t <= 150000; t += 1000)
+        tracking.observe({}, t, 4000, true, false);
+    require(tracking.locked && tracking.holding(), "Two minutes of silent/missing reference holds playback timing");
+    const double held = tracking.delay_at(150000);
+    require(tracking.delay_at(160000) == held && tracking.drift_at(150000) == 0,
+        "Holdover extrapolation is bounded rather than drifting indefinitely");
+    for (int i = 0; i < 100; ++i) tracking.observe({}, 150000, 4000, true);
+    require(tracking.locked, "A frozen missing window cannot exhaust tracking confidence");
+    for (int64_t t = 151000; t < 180000; t += 1000) tracking.observe({}, t, 4000, true);
+    require(tracking.locked, "Temporary active interference keeps established playback running");
+    tracking.observe({}, 180000, 4000, true);
+    require(!tracking.locked, "Sustained fresh evidence of different audio still releases alignment");
+
+    const auto drifting_feed = noise(10 * analysis_rate, 65);
+    const size_t tracking_n = 2 * analysis_rate, tracking_maximum = drifting_feed.size() - tracking_n;
+    std::vector<float> drifting_reference(tracking_n);
+    for (const double slope : {-4.0, -2.0, 2.0, 4.0}) {
+        for (size_t i = 0; i < tracking_n; ++i) {
+            const double position = double(tracking_maximum) - analysis_rate + i * (1 - slope / 1000);
+            const size_t index = size_t(position);
+            drifting_reference[i] = float(drifting_feed[index] * (1 - (position - index)) + drifting_feed[index + 1] * (position - index));
+        }
+        const double midpoint_delay = 1000 + slope;
+        const auto tracked = estimate_tracking(drifting_reference, drifting_feed, std::vector<uint8_t>(drifting_feed.size(), 1), midpoint_delay, 0);
+        require(tracked.reliable && std::abs(tracked.delay_ms - midpoint_delay) < 1,
+            "Actual time-warped audio remains matchable while media clocks drift in either direction");
+    }
 
     SearchProgress search;
     for (int i = 0; i < 120; ++i)

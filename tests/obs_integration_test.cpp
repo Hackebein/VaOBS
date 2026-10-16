@@ -74,13 +74,13 @@ void capture(void *data, obs_source_t *, const audio_data *audio, bool)
     for (size_t i = 0; i < audio->frames; ++i) {
         const int64_t index = start + int64_t(i);
         if (index < 0 || index >= int64_t(probe.music->size())) continue;
-        // Feed packets stop at 28 s; its final received content ends at
-        // reference time 28 s + 21.149 s. The output must then become silence.
-        const int64_t available_end = 28 * 48000 + 1015152;
+        // Feed packets stop at 42 s; its final received content ends at
+        // reference time 42 s + 21.149 s. The output must then become silence.
+        const int64_t available_end = 42 * 48000 + 1015152;
         const double expected = index < available_end ? (*probe.music)[size_t(index)] / 17 : 0;
         const double delta = samples[i] / 17 - expected;
         probe.error += delta * delta; probe.energy += expected * expected; ++probe.good_frames;
-        if (index >= 29 * 48000 && index < available_end) ++probe.tail_frames;
+        if (index >= 43 * 48000 && index < available_end) ++probe.tail_frames;
     }
 }
 
@@ -144,7 +144,7 @@ int main(int argc, char **argv)
         obs_data_set_string_fn(settings, "reference_source", "VRChatAudio");
         obs_data_set_int_fn(settings, "stream_generation", 1);
         constexpr size_t rate = 48000, block = 480, delay = 1015152;
-        std::vector<float> music(60 * rate);
+        std::vector<float> music(90 * rate);
         std::mt19937 rng(1234); std::normal_distribution<float> random(0, .25f);
         float smooth = 0;
         for (float &sample : music) { smooth = .7f * smooth + .3f * random(rng); sample = smooth; }
@@ -177,19 +177,22 @@ int main(int argc, char **argv)
         const auto start = std::chrono::steady_clock::now();
         const int64_t origin_frame = vaobs::TimedBuffer::frame_at(obsapi::os_gettime_ns(), rate);
         probe.origin_frame = origin_frame;
-        for (size_t packet = 0; packet < 5000; ++packet) {
+        for (size_t packet = 0; packet < 6500; ++packet) {
             std::this_thread::sleep_until(start + std::chrono::milliseconds(packet * 10));
             const size_t offset = packet * block;
             for (size_t i = 0; i < block; ++i) {
-                reference_left[i] = music[offset + i] / 17; reference_right[i] = reference_left[i] * .7f;
-                left[i] = packet < 2800 ? music[offset + i + delay] : 0;
+                // Silence for long enough that the old ten-failure policy
+                // would interrupt the otherwise valid buffered audio.
+                reference_left[i] = packet >= 3000 && packet < 4500 ? 0 : music[offset + i] / 17;
+                reference_right[i] = reference_left[i] * .7f;
+                left[i] = packet < 4200 ? music[offset + i + delay] : 0;
                 right[i] = left[i] * .7f;
             }
             const int64_t position = origin_frame + int64_t(offset);
             audio.timestamp = uint64_t(position / rate) * 1000000000ULL + uint64_t(position % rate) * 1000000000ULL / rate;
             audio.data[0] = reinterpret_cast<uint8_t *>(reference_left); audio.data[1] = reinterpret_cast<uint8_t *>(reference_right);
             obsapi::obs_source_output_audio(reference, &audio);
-            if (packet < 2800) {
+            if (packet < 4200) {
                 audio.data[0] = reinterpret_cast<uint8_t *>(left); audio.data[1] = reinterpret_cast<uint8_t *>(right);
                 obsapi::obs_source_output_audio(feed, &audio);
             }
@@ -212,7 +215,7 @@ int main(int argc, char **argv)
         const bool pass = probe.good_frames >= rate && probe.tail_frames >= 19 * rate && error < 1e-4 && probe.reset_silent;
         std::cout << "Aligned frames=" << probe.good_frames << ", frames after feed stopped=" << probe.tail_frames << ", relative error=" << error << '\n';
         if (!pass) throw std::runtime_error("Live alignment, independent tail playback, or reset failed");
-        std::cout << "PASS: private player aligned 21,149 ms, refreshed status, drained its audio tail, and reset/muted correctly\n";
+        std::cout << "PASS: private player aligned 21,149 ms, held through reference silence, drained its audio tail, and reset/muted correctly\n";
 
         // Three online players: the newest is wrong, the second matches, and
         // later the reference moves to the third. Exercise the real analyst,
@@ -262,7 +265,7 @@ int main(int argc, char **argv)
         obsapi::obs_source_add_audio_capture_callback(aligned, SearchOutput::capture, &search_output);
         const auto search_start = std::chrono::steady_clock::now();
         const int64_t search_origin = vaobs::TimedBuffer::frame_at(obsapi::os_gettime_ns(), rate);
-        for (size_t packet = 0; packet < 4200; ++packet) {
+        for (size_t packet = 0; packet < 6200; ++packet) {
             std::this_thread::sleep_until(search_start + std::chrono::milliseconds(packet * 10));
             const auto url = current_url();
             if (packet < 300 && url != "test://wrong")
@@ -272,13 +275,13 @@ int main(int argc, char **argv)
                     << "[Video Playback] Resolving URL 'test://wrong'\n";
             if (packet == 1500 && (!first_match || url != "test://one"))
                 throw std::runtime_error("Automatic search did not retain the matching player through another player's log update");
-            if (packet == 3500) {
+            if (packet == 5500) {
                 if (!second_match) throw std::runtime_error("Sustained loss did not find the other matching player");
                 obs_data_set_string_fn(settings, "video_selection", "test://wrong");
                 obs_source_update_fn(aligned, settings);
             }
-            if (packet > 3600 && url != "test://wrong") throw std::runtime_error("Manual URL cycled despite being pinned");
-            if (packet > 3600) search_output.expect_silence = true;
+            if (packet > 5600 && url != "test://wrong") throw std::runtime_error("Manual URL cycled despite being pinned");
+            if (packet > 5600) search_output.expect_silence = true;
             if (packet % 100 == 0) {
                 auto *p = obs_source_properties_fn(aligned);
                 const std::string text = obs_property_description_fn(obsapi::obs_properties_get(p, "status"));

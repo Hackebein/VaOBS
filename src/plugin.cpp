@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "obs-api.hpp"
 #include "alignment.hpp"
+#include "playback.hpp"
 #include "logs.hpp"
 #include "dock.hpp"
 #include "build-version.hpp"
@@ -71,12 +72,15 @@ struct ClockMapper {
 struct Aligner {
     obs_source_t *source, *reference = nullptr, *feed = nullptr;
     std::mutex binding_mutex, pcm_mutex, analysis_mutex, sleep_mutex;
+    std::recursive_mutex children_mutex;
+    obs_source_t *active_reference = nullptr;
     std::condition_variable wake;
     std::atomic<bool> stopping{false}, ready{false}, connected{false}, playing{false};
     std::atomic<bool> search_next{false};
     std::atomic<bool> retry_requested{false};
     std::atomic<unsigned> next_requested{0};
     std::atomic<double> applied_ms{0};
+    std::atomic<double> delay_drift{0}, playback_speed{1}, playback_delay{0};
     std::atomic<uint64_t> audio_generation{0};
     std::atomic<uint64_t> last_feed_packet{0};
     std::atomic<uint64_t> last_reference_packet{0}, last_reference_signal{0};
@@ -103,7 +107,7 @@ struct Aligner {
     uint64_t playback_revision = 0, applied_revision = 0;
     Timeline reference_history, feed_history;
     ClockMapper reference_clock, feed_clock;
-    TimedBuffer pcm;
+    ElasticBuffer pcm;
     Lock controller;
     SearchProgress search_progress;
     std::thread analyst, output, watcher, prober;
@@ -150,6 +154,11 @@ struct Aligner {
     {
         const bool was_connected = connected.exchange(false);
         if (reference) {
+            {
+                std::lock_guard<std::recursive_mutex> children(children_mutex);
+                if (active_reference) obsapi::obs_source_remove_active_child(source, active_reference);
+                active_reference = nullptr;
+            }
             obsapi::obs_source_remove_audio_capture_callback(reference, reference_audio, this);
             obsapi::obs_source_release(reference); reference = nullptr;
         }
@@ -165,7 +174,7 @@ struct Aligner {
     {
         reference_history.clear(); feed_history.clear();
         reference_clock.clear(); feed_clock.clear();
-        controller.reset(); ready = false; applied_ms = 0;
+        controller.reset(); ready = false; applied_ms = delay_drift = playback_delay = 0; playback_speed = 1;
         search_progress.reset(); search_next = false;
         match_candidate = false; last_reference_packet = 0; last_reference_signal = 0;
         pcm.configure(sample_rate, channels, max_delay_ms);
@@ -261,6 +270,13 @@ struct Aligner {
             reset();
         }
         obsapi::obs_source_add_audio_capture_callback(reference, reference_audio, this);
+        {
+            // Hidden application-audio captures stop producing packets unless
+            // something keeps them active. Own that lifecycle without changing
+            // the user's scene visibility, mute, volume, or recording tracks.
+            std::lock_guard<std::recursive_mutex> children(children_mutex);
+            if (obsapi::obs_source_add_active_child(source, reference)) active_reference = reference;
+        }
         connected = true;
         obsapi::blog(LOG_INFO, "[VaOBS] Aligning internal player against '%s'", reference_name.c_str());
     }
@@ -589,7 +605,8 @@ struct Aligner {
                 audio.timestamp = uint64_t(position / rate) * 1000000000ULL + uint64_t(position % rate) * 1000000000ULL / rate;
                 float *planes[MAX_AV_PLANES]{};
                 for (size_t ch = 0; ch < count; ++ch) planes[ch] = storage[ch].data();
-                pcm.render(planes, frames, audio.timestamp, ready.load(), applied_ms.load());
+                pcm.render(planes, frames, audio.timestamp, ready.load(), applied_ms.load(), delay_drift.load());
+                playback_speed = pcm.speed(); playback_delay = pcm.delay_ms();
                 for (size_t ch = 0; ch < count; ++ch) audio.data[ch] = reinterpret_cast<uint8_t *>(planes[ch]);
             }
             audio.frames = uint32_t(frames); audio.samples_per_sec = rate;
@@ -614,10 +631,10 @@ struct Aligner {
             if (stopping) break;
             std::vector<float> ref, target;
             std::vector<uint8_t> valid, ref_valid;
-            uint64_t epoch; double minimum;
+            uint64_t epoch; double minimum, expected_delay = 0, expected_drift = 0;
             int64_t window_end_ms = 0;
             int analysis_window_ms = 0;
-            bool usable = false, full_range = false;
+            bool usable = false, full_range = false, tracking = false;
             {
                 std::lock_guard<std::mutex> lock(analysis_mutex);
                 if (!connected || !playing) continue;
@@ -625,8 +642,11 @@ struct Aligner {
                 // The feed may already have paused/ended while the reference
                 // still plays its buffered tail. Compare against reference time.
                 const int64_t end = reference_history.end() - analysis_rate / 5;
-                analysis_window_ms = std::max(int(window_ms), controller.window_ms());
+                tracking = controller.locked;
+                analysis_window_ms = controller.window_ms() ? controller.window_ms() : tracking ? 2000 : int(window_ms);
                 window_end_ms = end * 1000 / analysis_rate;
+                const int64_t midpoint = window_end_ms - analysis_window_ms / 2;
+                expected_delay = controller.delay_at(midpoint); expected_drift = controller.drift_at(midpoint);
                 const int64_t n = int64_t(analysis_window_ms) * analysis_rate / 1000;
                 const int64_t maximum = std::min(int64_t(max_delay_ms * analysis_rate / 1000), end - n - feed_history.first());
                 const double now = double(obsapi::os_gettime_ns()) * analysis_rate / 1e9;
@@ -643,7 +663,8 @@ struct Aligner {
                 }
             }
             Match match;
-            if (usable) match = estimate(ref, target, valid, minimum);
+            if (usable && tracking) match = estimate_tracking(ref, target, valid, expected_delay, expected_drift, minimum);
+            if (usable && !match.reliable) match = estimate(ref, target, valid, minimum);
             double reference_energy = 0;
             for (const float sample : ref) reference_energy += double(sample) * sample;
             const bool reference_active = usable && reference_energy > ref.size() * minimum_energy;
@@ -652,8 +673,10 @@ struct Aligner {
                 if (epoch != generation) continue;
                 const bool was_ready = controller.locked;
                 const double previous = controller.delay_ms;
-                controller.observe(match, window_end_ms, analysis_window_ms, full_range);
-                ready = controller.locked; applied_ms = controller.delay_ms;
+                controller.observe(match, window_end_ms, analysis_window_ms, full_range, reference_active);
+                const int64_t time_ms = int64_t(obsapi::os_gettime_ns() / 1000000);
+                ready = controller.locked; applied_ms = std::clamp(controller.delay_at(time_ms), 0.0, max_delay_ms);
+                delay_drift = controller.drift_at(time_ms);
                 match_candidate = controller.confirming() || (controller.locked && match.reliable);
                 if (search_progress.observe(controller.locked, match_candidate,
                                             reference_active, full_range)) search_next = true;
@@ -711,7 +734,13 @@ struct Aligner {
         } else if (ready) {
             char text[80]; std::snprintf(text, sizeof(text), "Aligned - %.0f ms", applied_ms.load());
             view.state = "aligned"; view.title = text;
-            view.detail = match_candidate ? "Reference: '" + reference_name + "'." : "Holding the last reliable delay.";
+            if (controller.holding()) view.detail = "Holding timing while listening for a clear match.";
+            else {
+                char timing[140];
+                std::snprintf(timing, sizeof(timing), "Playback %.2f%%; remaining correction %+.1f ms.",
+                    playback_speed.load() * 100, playback_delay.load() - applied_ms.load());
+                view.detail = timing;
+            }
         } else if (!fresh(last_feed_packet)) {
             view.state = "checking"; view.title = "Connecting...";
             view.detail = "The stream has not delivered audio.";
@@ -878,6 +907,8 @@ bool obs_module_load()
     info.get_defaults = defaults; info.get_properties = properties;
     info.enum_active_sources = [](void *data, obs_source_enum_proc_t callback, void *param) {
         auto &item = *static_cast<Aligner *>(data);
+        std::lock_guard<std::recursive_mutex> children(item.children_mutex);
+        if (item.active_reference) callback(item.source, item.active_reference, param);
         callback(item.source, item.feed, param);
     };
     obsapi::obs_register_source_s(&info, sizeof(info));

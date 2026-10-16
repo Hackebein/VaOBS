@@ -129,6 +129,40 @@ inline Match estimate(const std::vector<float> &reference, const std::vector<flo
     return result;
 }
 
+// Track near an established offset, allowing a small difference in media
+// clock rate. Fixed-rate correlation loses the peak when the signals slide
+// past one another within an analysis window.
+inline Match estimate_tracking(const std::vector<float> &reference, const std::vector<float> &feed,
+                              const std::vector<uint8_t> &valid, double expected_delay_ms,
+                              double expected_drift_ms_per_second, double minimum_correlation = .75)
+{
+    Match best;
+    if (feed.size() < reference.size() || valid.size() != feed.size()) return best;
+    constexpr size_t radius = analysis_rate / 4;
+    const size_t n = reference.size(), maximum = feed.size() - n;
+    const double center = double(maximum) + double(n) / 2 - expected_delay_ms * analysis_rate / 1000;
+    std::vector<float> warped(n + 2 * radius);
+    std::vector<uint8_t> present(warped.size());
+    for (int candidate = 0; candidate <= 16; ++candidate) {
+        const double adjustment = candidate == 0 ? 0 : ((candidate + 1) / 2) * .5 * (candidate % 2 ? 1 : -1);
+        const double drift = std::clamp(expected_drift_ms_per_second + adjustment, -20.0, 20.0);
+        const double scale = 1 - drift / 1000;
+        for (size_t i = 0; i < warped.size(); ++i) {
+            const double position = center + (double(i) - radius - double(n) / 2) * scale;
+            const int64_t index = int64_t(std::floor(position));
+            const bool exists = index >= 0 && index + 1 < int64_t(feed.size()) && valid[size_t(index)] && valid[size_t(index + 1)];
+            present[i] = exists;
+            const double fraction = position - double(index);
+            warped[i] = exists ? float(feed[size_t(index)] * (1 - fraction) + feed[size_t(index + 1)] * fraction) : 0;
+        }
+        auto match = estimate(reference, warped, present, minimum_correlation);
+        match.delay_ms = expected_delay_ms + (match.delay_ms - 250) * scale;
+        if (match.reliable && (!best.reliable || match.correlation > best.correlation)) best = match;
+        if (best.reliable && best.correlation >= .97) break;
+    }
+    return best;
+}
+
 // Timestamped, bounded analysis history. Missing packets stay invalid rather
 // than being silently treated as real audio. Samples are averaged onto a common
 // 2 kHz grid, including when OBS uses 44.1 kHz or variable packet sizes.
@@ -222,6 +256,9 @@ class Lock {
     double pending_ = -1;
     int strong_confirmations_ = 0, weak_confirmations_ = 0, failures_ = 0;
     int64_t last_window_end_ = -1, last_confirmation_end_ = -1;
+    int64_t measured_at_ = -1, pending_at_ = -1;
+    double drift_ = 0;
+    bool holding_ = false;
     int verification_window_ms_ = 0;
     void clear_pending()
     {
@@ -233,35 +270,57 @@ public:
     double delay_ms = 0;
     int window_ms() const { return verification_window_ms_; }
     bool confirming() const { return pending_ >= 0; }
+    bool holding() const { return locked && holding_; }
+    double drift_at(int64_t time_ms) const { return measured_at_ >= 0 && time_ms - measured_at_ < 10000 ? drift_ : 0; }
+    double delay_at(int64_t time_ms) const {
+        return std::max(0.0, delay_ms + drift_ * std::clamp(double(time_ms - measured_at_) / 1000, 0.0, 10.0));
+    }
     void reset()
     {
         clear_pending(); failures_ = 0; last_window_end_ = -1;
-        verification_window_ms_ = 0; locked = false; delay_ms = 0;
+        verification_window_ms_ = 0; locked = false; delay_ms = drift_ = 0;
+        measured_at_ = pending_at_ = -1; holding_ = false;
     }
-    void observe(const Match &m, int64_t window_end_ms, int window_ms, bool full_range)
+    void observe(const Match &m, int64_t window_end_ms, int window_ms, bool full_range,
+                 bool reference_active = true)
     {
+        // Frozen windows and absent/silent reference audio are not evidence
+        // that the selected stream is wrong. Keep its established timing.
+        if (window_end_ms <= last_window_end_) { holding_ = true; return; }
+        last_window_end_ = window_end_ms;
+        if (!reference_active) { clear_pending(); holding_ = true; return; }
         const bool strong = m.correlation >= .97;
-        if (m.reliable && !strong) verification_window_ms_ = 12000;
+        holding_ = !m.reliable;
         if (!m.reliable) {
             clear_pending();
-            if (++failures_ >= 10) locked = false;
+            if (++failures_ >= 30) locked = false;
             return;
         }
-        // Re-reading the same audio must never add confidence.
-        if (window_end_ms <= last_window_end_) return;
-        last_window_end_ = window_end_ms;
-        if (locked && std::abs(m.delay_ms - delay_ms) <= 1) {
+        const int64_t measured = window_end_ms - window_ms / 2;
+        // Once acquired, a nearby reliable peak can track a moving offset.
+        // The strict acquisition path below still protects unexpected jumps.
+        if (locked && std::abs(m.delay_ms - delay_at(measured)) <= 25) {
+            const double seconds = double(measured - measured_at_) / 1000;
+            if (std::abs(m.delay_ms - delay_ms) < .1) drift_ = 0;
+            else if (seconds > 0 && seconds <= 10)
+                drift_ = .8 * drift_ + .2 * std::clamp((m.delay_ms - delay_ms) / seconds, -20.0, 20.0);
+            else drift_ = 0;
+            delay_ms = m.delay_ms; measured_at_ = measured;
             failures_ = 0; clear_pending(); verification_window_ms_ = 0; return;
         }
+        if (!strong) verification_window_ms_ = 12000;
         // Weak matches need a clearer winner than normal tracking does.
         if (!strong && m.prominence < 1.2) {
             clear_pending();
-            if (++failures_ >= 10) locked = false;
+            holding_ = true;
+            if (++failures_ >= 30) locked = false;
             return;
         }
-        if (pending_ < 0 || std::abs(m.delay_ms - pending_) > 2) {
+        const double tolerance = 2 + std::max(0.0, double(measured - pending_at_)) * .02;
+        if (pending_ < 0 || std::abs(m.delay_ms - pending_) > tolerance) {
             clear_pending(); pending_ = m.delay_ms;
         }
+        pending_ = m.delay_ms; pending_at_ = measured;
         strong_confirmations_ = strong ? strong_confirmations_ + 1 : 0;
         // Count distinct passages, rather than successive overlapping windows.
         if (window_ms >= 12000 && m.prominence >= 1.2 &&
@@ -271,9 +330,10 @@ public:
         // Before the full range exists, a repeated phrase can hide the real
         // delayed passage. Strong matches retain the quick two-check path.
         if (strong_confirmations_ >= 2 || (weak_confirmations_ >= 3 && full_range)) {
-            delay_ms = m.delay_ms; locked = true; failures_ = 0;
+            delay_ms = m.delay_ms; measured_at_ = measured; drift_ = 0;
+            locked = true; holding_ = false; failures_ = 0;
             clear_pending(); verification_window_ms_ = 0;
-        } else if (++failures_ >= 10) {
+        } else if (++failures_ >= 30) {
             locked = false;
         }
     }
@@ -317,6 +377,7 @@ class TimedBuffer {
         return float(r[slot] * (1 - f) + r[next] * f);
     }
 public:
+    float sample(size_t channel, double index) const { return read(channel, index); }
     static int64_t frame_at(uint64_t timestamp, uint32_t rate)
     {
         return int64_t(timestamp / 1000000000ULL) * rate +
