@@ -11,6 +11,7 @@
 namespace vaobs {
 
 constexpr int analysis_rate = 2000;
+constexpr double minimum_energy = 1e-14;
 
 struct Match {
     double delay_ms = 0;
@@ -67,7 +68,7 @@ inline Match estimate(const std::vector<float> &reference, const std::vector<flo
         energy += v * v;
     }
     // Don't calibrate on silence or floating point noise.
-    if (energy / n < 1e-10) return result;
+    if (energy / n < minimum_energy) return result;
     std::vector<double> sums(feed.size() + 1), squares(feed.size() + 1);
     std::vector<size_t> counts(feed.size() + 1);
     for (size_t i = 0; i < feed.size(); ++i) {
@@ -85,7 +86,7 @@ inline Match estimate(const std::vector<float> &reference, const std::vector<flo
         if (counts[k + n] - counts[k] < n * .98) continue;
         const double sum = sums[k + n] - sums[k];
         const double variance = squares[k + n] - squares[k] - sum * sum / n;
-        if (variance / n < 1e-10) continue;
+        if (variance / n < minimum_energy) continue;
         signed_scores[k] = b[k].real() / std::sqrt(energy * variance);
         scores[k] = std::min(1.0, std::abs(signed_scores[k]));
     }
@@ -219,31 +220,79 @@ public:
 
 class Lock {
     double pending_ = -1;
-    int confirmations_ = 0, failures_ = 0;
-    bool acquired_ = false;
+    int strong_confirmations_ = 0, weak_confirmations_ = 0, failures_ = 0;
+    int64_t last_window_end_ = -1, last_confirmation_end_ = -1;
+    int verification_window_ms_ = 0;
+    void clear_pending()
+    {
+        pending_ = -1; strong_confirmations_ = weak_confirmations_ = 0;
+        last_confirmation_end_ = -1;
+    }
 public:
     bool locked = false;
     double delay_ms = 0;
-    void reset() { pending_ = -1; confirmations_ = failures_ = 0; locked = acquired_ = false; delay_ms = 0; }
-    void observe(const Match &m)
+    int window_ms() const { return verification_window_ms_; }
+    bool confirming() const { return pending_ >= 0; }
+    void reset()
     {
-        // Short repeated musical phrases can resemble a valid match before
-        // the true delayed passage has reached the reference. Initial lock
-        // requires near-identical audio, not just the tracking threshold.
-        if (!m.reliable || (!acquired_ && m.correlation < .97)) {
-            confirmations_ = 0;
+        clear_pending(); failures_ = 0; last_window_end_ = -1;
+        verification_window_ms_ = 0; locked = false; delay_ms = 0;
+    }
+    void observe(const Match &m, int64_t window_end_ms, int window_ms, bool full_range)
+    {
+        const bool strong = m.correlation >= .97;
+        if (m.reliable && !strong) verification_window_ms_ = 12000;
+        if (!m.reliable) {
+            clear_pending();
             if (++failures_ >= 10) locked = false;
             return;
         }
-        failures_ = 0;
-        if (locked && std::abs(m.delay_ms - delay_ms) <= 1) return;
+        // Re-reading the same audio must never add confidence.
+        if (window_end_ms <= last_window_end_) return;
+        last_window_end_ = window_end_ms;
+        if (locked && std::abs(m.delay_ms - delay_ms) <= 1) {
+            failures_ = 0; clear_pending(); verification_window_ms_ = 0; return;
+        }
+        // Weak matches need a clearer winner than normal tracking does.
+        if (!strong && m.prominence < 1.2) {
+            clear_pending();
+            if (++failures_ >= 10) locked = false;
+            return;
+        }
         if (pending_ < 0 || std::abs(m.delay_ms - pending_) > 2) {
-            pending_ = m.delay_ms; confirmations_ = 1; return;
+            clear_pending(); pending_ = m.delay_ms;
         }
-        if (++confirmations_ >= 2) {
-            delay_ms = m.delay_ms; locked = acquired_ = true;
-            pending_ = -1; confirmations_ = 0;
+        strong_confirmations_ = strong ? strong_confirmations_ + 1 : 0;
+        // Count distinct passages, rather than successive overlapping windows.
+        if (window_ms >= 12000 && m.prominence >= 1.2 &&
+            (last_confirmation_end_ < 0 || window_end_ms - last_confirmation_end_ >= window_ms)) {
+            ++weak_confirmations_; last_confirmation_end_ = window_end_ms;
         }
+        // Before the full range exists, a repeated phrase can hide the real
+        // delayed passage. Strong matches retain the quick two-check path.
+        if (strong_confirmations_ >= 2 || (weak_confirmations_ >= 3 && full_range)) {
+            delay_ms = m.delay_ms; locked = true; failures_ = 0;
+            clear_pending(); verification_window_ms_ = 0;
+        } else if (++failures_ >= 10) {
+            locked = false;
+        }
+    }
+};
+
+// Do not reject an initial candidate before the whole delay range is covered.
+// Silence or a missing reference cannot tell us which player is audible.
+class SearchProgress {
+    bool matched_ = false;
+    unsigned failures_ = 0;
+public:
+    void reset() { matched_ = false; failures_ = 0; }
+    bool matched() const { return matched_; }
+    bool observe(bool locked, bool reliable, bool reference_active, bool full_range)
+    {
+        matched_ = matched_ || locked;
+        if (!reference_active || reliable || (!matched_ && !full_range)) { failures_ = 0; return false; }
+        ++failures_;
+        return !locked && failures_ >= (matched_ ? 10U : 3U);
     }
 };
 

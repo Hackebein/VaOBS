@@ -23,7 +23,9 @@ jobs:
             .build/toolchain
             .build/obs-sdk
             .build/obs-runtime
-          key: windows-zig-0.17.0-obs-32.2.2
+            .build/qt6
+            .build/msvc
+          key: windows-zig-0.17.0-obs-32.2.2-qt-2026-07-15-msvc-14.44
 
       - name: Download official OBS runtime for integration tests
         shell: pwsh
@@ -40,15 +42,17 @@ jobs:
 
       - name: Build, test, and package
         shell: pwsh
-        run: ./scripts/build-windows.ps1 -ObsBinPath '.build/obs-runtime/bin/64bit'
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev' }
+          ./scripts/build-windows.ps1 -ObsBinPath '.build/obs-runtime/bin/64bit' -Version $version
 
       - name: Upload Windows release bundle
         uses: actions/upload-artifact@v4
         with:
           name: vaobs-windows-live-alignment
           path: |
-            dist/vaobs-audio-align.dll
-            dist/vaobs-windows-live-alignment.zip
+            dist/vaobs-*-windows-x64.zip
+            dist/vaobs-*-windows-x64.sha256
           retention-days: 30
 
       - name: Create release on tag
@@ -57,4 +61,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create $env:GITHUB_REF_NAME dist/vaobs-windows-live-alignment.zip --title "VaOBS $env:GITHUB_REF_NAME" --notes-file README.md --verify-tag
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          gh release create $env:GITHUB_REF_NAME "dist/vaobs-$version-windows-x64.zip" "dist/vaobs-$version-windows-x64.sha256" --title "VaOBS $env:GITHUB_REF_NAME" --notes 'Audio-only OBS plugin with automatic stream matching, alignment, and a live status dock. Windows x64; tested with OBS 32.2.2. See the included README for setup.' --verify-tag
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
